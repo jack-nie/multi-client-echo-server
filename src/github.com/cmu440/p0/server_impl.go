@@ -11,23 +11,26 @@ import (
 type multiEchoServer struct {
 	ls          net.Listener
 	clientCount int
-	clients     map[string]multiEchoClient
+	clients     chan map[string]multiEchoClient
 	msg         chan []byte
 }
 
 type multiEchoClient struct {
-	msg  chan []byte
-	conn net.Conn
+	msg       chan []byte
+	conn      net.Conn
+	closeChan chan struct{}
 }
 
 // New creates and returns (but does not start) a new MultiEchoServer.
 func New() MultiEchoServer {
-	return &multiEchoServer{
+	s := &multiEchoServer{
 		ls:          nil,
 		clientCount: 0,
-		clients:     make(map[string]multiEchoClient),
+		clients:     make(chan map[string]multiEchoClient, 1),
 		msg:         make(chan []byte),
 	}
+	s.clients <- make(map[string]multiEchoClient, 1)
+	return s
 }
 
 func (mes *multiEchoServer) Start(port int) error {
@@ -49,21 +52,22 @@ func (mes *multiEchoServer) Start(port int) error {
 	go func() {
 		for {
 			msg := <-mes.msg
-			for _, client := range mes.clients {
-				if len(client.msg) < 100 {
-					client.msg <- msg
-				}
+			cli := <-mes.clients
+			for _, client := range cli {
+				client.msg <- msg
 			}
+			mes.clients <- cli
 		}
 	}()
 	return err
 }
 
 func (mes *multiEchoServer) Close() {
-	for _, client := range mes.clients {
-		client.conn.Close()
-		mes.clientCount--
+	cli := <-mes.clients
+	for _, client := range cli {
+		client.closeChan <- struct{}{}
 	}
+	mes.clients <- cli
 	mes.ls.Close()
 }
 
@@ -73,19 +77,29 @@ func (mes *multiEchoServer) Count() int {
 
 func addClient(mes *multiEchoServer, conn net.Conn) {
 	client := multiEchoClient{
-		msg:  make(chan []byte, 100),
-		conn: conn,
+		msg:       make(chan []byte, 100),
+		conn:      conn,
+		closeChan: make(chan struct{}),
 	}
 
-	mes.clients[conn.RemoteAddr().String()] = client
+	cli := <-mes.clients
+	cli[conn.RemoteAddr().String()] = client
+	mes.clients <- cli
 	mes.clientCount++
 	go func() {
 		for {
-			msg := <-client.msg
-			_, err := conn.Write(msg)
-			if err != nil {
+			select {
+			case msg, ok := <-client.msg:
+				if !ok {
+					return
+				}
+				_, err := conn.Write(msg)
+				if err != nil {
+					return
+				}
+			case <-client.closeChan:
+				client.conn.Close()
 				removeClient(mes, conn)
-				return
 			}
 		}
 	}()
@@ -95,7 +109,7 @@ func addClient(mes *multiEchoServer, conn net.Conn) {
 		for {
 			line, err := content.ReadBytes('\n')
 			if err != nil {
-				removeClient(mes, conn)
+				client.closeChan <- struct{}{}
 				return
 			}
 			mes.msg <- line
@@ -104,6 +118,8 @@ func addClient(mes *multiEchoServer, conn net.Conn) {
 }
 
 func removeClient(mes *multiEchoServer, conn net.Conn) {
-	delete(mes.clients, conn.RemoteAddr().String())
+	cli := <-mes.clients
+	delete(cli, conn.RemoteAddr().String())
+	mes.clients <- cli
 	mes.clientCount--
 }
