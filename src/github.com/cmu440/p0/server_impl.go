@@ -27,7 +27,7 @@ func New() MultiEchoServer {
 		ls:          nil,
 		clientCount: 0,
 		clients:     make(chan map[string]multiEchoClient, 1),
-		msg:         make(chan []byte),
+		msg:         make(chan []byte, 100),
 	}
 	s.clients <- make(map[string]multiEchoClient, 1)
 	return s
@@ -43,18 +43,27 @@ func (mes *multiEchoServer) Start(port int) error {
 	go func() {
 		for {
 			conn, err := mes.ls.Accept()
-			if err == nil {
-				addClient(mes, conn)
+			if err != nil {
+				return
 			}
+			addClient(mes, conn)
 		}
 	}()
 
 	go func() {
 		for {
-			msg := <-mes.msg
+			msg, ok := <-mes.msg
+			if !ok {
+				return
+			}
 			cli := <-mes.clients
 			for _, client := range cli {
-				client.msg <- msg
+				select {
+				case client.msg <- msg:
+					break
+				default:
+					break
+				}
 			}
 			mes.clients <- cli
 		}
