@@ -1,134 +1,161 @@
-// Implementation of a MultiEchoServer. Students should write their code in this file.
 package p0
 
 import (
 	"bufio"
 	"fmt"
+	"io"
 	"net"
-	"strconv"
 )
 
+// MAXN limits the max messages a client can write.
+const MAXN = 100
+
 type multiEchoServer struct {
-	ls          net.Listener
-	clientCount int
-	clients     chan map[string]multiEchoClient
-	msg         chan []byte
+	listener       net.Listener
+	currentClients []*client
+	newMessage     chan []byte
+	newConnection  chan net.Conn
+	deadClient     chan *client
+	countClients   chan int
+	clientCount    chan int
+	quitMain       chan int
+	quitAccept     chan int
 }
 
-type multiEchoClient struct {
-	msg       chan []byte
-	conn      net.Conn
-	closeChan chan struct{}
+type client struct {
+	conn         net.Conn
+	messageQueue chan []byte
+	quitRead     chan int
+	quitWrite    chan int
 }
 
 // New creates and returns (but does not start) a new MultiEchoServer.
 func New() MultiEchoServer {
 	s := &multiEchoServer{
-		ls:          nil,
-		clientCount: 0,
-		clients:     make(chan map[string]multiEchoClient, 1),
-		msg:         make(chan []byte, 100),
-	}
-	s.clients <- make(map[string]multiEchoClient, 1)
+		nil,
+		nil,
+		make(chan []byte),
+		make(chan net.Conn),
+		make(chan *client),
+		make(chan int),
+		make(chan int),
+		make(chan int),
+		make(chan int)}
+
 	return s
 }
 
 func (mes *multiEchoServer) Start(port int) error {
-	listen, err := net.Listen("tcp", ":"+strconv.Itoa(port))
+	addr, err := net.ResolveTCPAddr("tcp", fmt.Sprintf(":%d", port))
 	if err != nil {
-		fmt.Println("Failed to listen on post: ", port)
+		return err
 	}
-	mes.ls = listen
+	listener, err := net.ListenTCP("tcp", addr)
+	if err != nil {
+		return err
+	}
+	mes.listener = listener
+	go runServer(mes)
+	go acceptConnection(mes)
+	return nil
+}
 
-	go func() {
-		for {
-			conn, err := mes.ls.Accept()
-			if err != nil {
-				return
+func runServer(mes *multiEchoServer) {
+	for {
+		select {
+		case newMessage := <-mes.newMessage:
+			for _, c := range mes.currentClients {
+				if len(c.messageQueue) == MAXN {
+					<-c.messageQueue
+				}
+				c.messageQueue <- newMessage
 			}
-			addClient(mes, conn)
-		}
-	}()
+		case newConnection := <-mes.newConnection:
+			c := &client{
+				newConnection,
+				make(chan []byte, MAXN),
+				make(chan int),
+				make(chan int)}
+			mes.currentClients = append(mes.currentClients, c)
+			go handleRead(mes, c)
+			go handleWrite(c)
 
-	go func() {
-		for {
-			msg, ok := <-mes.msg
-			if !ok {
-				return
-			}
-			cli := <-mes.clients
-			for _, client := range cli {
-				select {
-				case client.msg <- msg:
-					break
-				default:
+		case deadClient := <-mes.deadClient:
+			for i, c := range mes.currentClients {
+				if c == deadClient {
+					mes.currentClients =
+						append(mes.currentClients[:i], mes.currentClients[i+1:]...)
 					break
 				}
 			}
-			mes.clients <- cli
+		case <-mes.countClients:
+			mes.clientCount <- len(mes.currentClients)
+
+		case <-mes.quitMain:
+			for _, c := range mes.currentClients {
+				c.conn.Close()
+				c.quitWrite <- 0
+				c.quitRead <- 0
+			}
+			return
 		}
-	}()
-	return err
+	}
+
 }
 
-func (mes *multiEchoServer) Close() {
-	cli := <-mes.clients
-	for _, client := range cli {
-		client.closeChan <- struct{}{}
+func acceptConnection(mes *multiEchoServer) {
+	for {
+		select {
+		case <-mes.quitAccept:
+			return
+		default:
+			conn, err := mes.listener.Accept()
+			if err == nil {
+				mes.newConnection <- conn
+			}
+		}
 	}
-	mes.clients <- cli
-	mes.ls.Close()
 }
 
 func (mes *multiEchoServer) Count() int {
-	return mes.clientCount
+	mes.countClients <- 0
+	return <-mes.clientCount
 }
 
-func addClient(mes *multiEchoServer, conn net.Conn) {
-	client := multiEchoClient{
-		msg:       make(chan []byte, 100),
-		conn:      conn,
-		closeChan: make(chan struct{}),
-	}
+func (mes *multiEchoServer) Close() {
+	mes.listener.Close()
+	mes.quitAccept <- 0
+	mes.quitMain <- 0
+}
 
-	cli := <-mes.clients
-	cli[conn.RemoteAddr().String()] = client
-	mes.clients <- cli
-	mes.clientCount++
-	go func() {
-		for {
-			select {
-			case msg, ok := <-client.msg:
-				if !ok {
-					return
-				}
-				_, err := conn.Write(msg)
-				if err != nil {
-					return
-				}
-			case <-client.closeChan:
-				client.conn.Close()
-				removeClient(mes, conn)
-			}
-		}
-	}()
+func handleRead(mes *multiEchoServer, c *client) {
+	clientReader := bufio.NewReader(c.conn)
 
-	go func() {
-		content := bufio.NewReader(conn)
-		for {
-			line, err := content.ReadBytes('\n')
-			if err != nil {
-				client.closeChan <- struct{}{}
+	for {
+		select {
+		case <-c.quitRead:
+			return
+		default:
+			message, err := clientReader.ReadBytes('\n')
+
+			if err == io.EOF {
+				mes.deadClient <- c
+			} else if err != nil {
 				return
+			} else {
+				mes.newMessage <- message
 			}
-			mes.msg <- line
 		}
-	}()
+	}
 }
 
-func removeClient(mes *multiEchoServer, conn net.Conn) {
-	cli := <-mes.clients
-	delete(cli, conn.RemoteAddr().String())
-	mes.clients <- cli
-	mes.clientCount--
+func handleWrite(c *client) {
+	for {
+		select {
+		case <-c.quitWrite:
+			return
+		case message := <-c.messageQueue:
+			c.conn.Write(message)
+		}
+	}
 }
